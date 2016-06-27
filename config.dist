@@ -1,0 +1,5 @@
+{
+  timezone => '+03',
+  import_server => 'localhost:3000',
+  pause => 10
+}

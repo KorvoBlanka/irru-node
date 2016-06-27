@@ -1,0 +1,529 @@
+#!/usr/bin/env perl
+
+use Modern;
+
+use Util::Config;
+use Util::PhoneNum;
+
+use Mojo::Asset::File;
+use Mojo::ByteStream;
+use Mojo::UserAgent;
+use DateTime;
+use DateTime::Format::Strptime;
+use Text::Trim;
+use JSON;
+use MIME::Base64;
+use Data::Dumper;
+
+$Data::Dumper::Terse = 1;
+$Data::Dumper::Quotekeys = 0;
+
+no warnings 'experimental';
+
+my $config = Util::Config::get_config();
+
+my $import_server = $config->{import_server};
+my $timezone = $config->{timezone};
+my $pause = $config->{pause};
+my $media_id = $config->{media_id};
+
+my $parser = DateTime::Format::Strptime->new( pattern => '%Y-%m-%d %H:%M' );
+
+
+
+my $ua = Mojo::UserAgent->new;
+$ua->max_redirects(4);
+
+
+while (1) {
+    say 'cycle starts';
+    import_irru ();
+    sleep 1;
+}
+
+sub import_irru {
+    my $url_list = get_url_list();
+
+    say Dumper $url_list;
+
+    my $data_list = process_url_list($url_list);
+
+    say Dumper $data_list;
+
+    send_data($data_list);
+}
+
+sub send_data {
+    my $data_list = shift;
+
+    my $try_count = 10;
+
+    say 'sending data';
+
+    for my $data (@{$data_list}) {
+        my $url_str = $import_server . '/api/remote_import/upload_result';
+        my $data_str = Dumper $data;
+        my $done = 0;
+        while (!$done) {
+            my $tx = $ua->post($url_str => form => {data => $data_str});
+            if (my $res = $tx->success) {
+              $done = 1 if $res->json->{state} eq 'ok';
+              say Dumper $res->json;
+            } else {
+
+            }
+            $try_count -= 1;
+            if ($try_count == 0) {
+                $done = 1;
+                say 'fail to send';
+            }
+        }
+
+    }
+}
+
+sub get_url_list {
+    my $url_list;
+
+    my $tx = $ua->get($import_server . '/api/remote_import/get_task',
+      form => {
+        source => 'irr',
+        count => 1
+      }
+    );
+
+    if (my $res = $tx->success) {
+      $url_list = $res->json->{list};
+    } else {
+
+    }
+
+    return $url_list;
+}
+
+sub process_url_list {
+    my ($url_list_ref) = @_;
+    my @data_list;
+
+    for my $item (@$url_list_ref) {
+        my $item_url = $item->{url};
+
+        sleep $pause;
+        say 'processing ' . $item_url;
+
+        my $data = {
+            source_media_id => $media_id,
+            source_url => $item_url,
+            type_code => 'other',
+            offer_type_code => 'sale',
+
+        };
+
+        my $res = get_res($item_url, []);
+
+        my $dom;
+
+        if ($res) {
+            $dom = $res->dom;
+
+            eval {
+                parse_adv($dom, $data);
+
+                if (my $user_a = $dom->find('tr[class="seller"] a')->first) {
+                    my $user_ref = $user_a->{href};
+                    say $user_ref;
+                    unless ($user_ref =~ /^\/user/) {
+                        my $seller = $user_a->span->text;
+                        say 'seller: ' . $seller;
+                        foreach (@{$data->{'owner_phones'}}) {
+                            say 'mediator ' . $_;
+
+                        }
+                    }
+                }
+                push @data_list, $data;
+            } or do {
+                say $@;
+            }
+        }
+    }
+
+    return \@data_list;
+}
+
+sub parse_adv {
+    my ($dom, $data) = @_;
+
+    # дата размещения
+    my $date_str = $dom->find('div[class~="productPage__createDate"]')->first->text;
+    my $dt = parse_date($date_str);
+    $data->{'add_date'} = $dt->datetime() . $timezone;
+    say $data->{'add_date'};
+
+
+    # тип недвижимости и тип предложения
+    my $breadcrumbs = lc($dom->find('nav[class~="breadcrumbs"]')->first->all_text);
+    if ($breadcrumbs =~ /аренда/i) {
+        $data->{offer_type_code} = 'rent';
+        if ($breadcrumbs =~ /на сутки/i) {
+            $data->{rent_type} = 'short';
+        }
+    } else {
+        $data->{offer_type_code} = 'sale';
+    }
+
+    if ($breadcrumbs =~ /квартир/) {
+        $data->{type_code} = 'apartment';
+    } elsif ($breadcrumbs =~ /таунхаус/) {
+        $data->{type_code} = 'townhouse';
+    } elsif ($breadcrumbs =~ /малосем/) {
+        $data->{type_code} = 'apartment_small';
+    } elsif ($breadcrumbs =~ /комнат/) {
+        $data->{type_code} = 'room';
+    } elsif ($breadcrumbs =~ /домов/) {
+        $data->{type_code} = 'house';
+    } elsif ($breadcrumbs =~ /дач/) {
+        $data->{type_code} = 'dacha';
+    } elsif ($breadcrumbs =~ /коттедж/) {
+        $data->{type_code} = 'cottage';
+    } elsif ($breadcrumbs =~ /участок/) {
+        $data->{type_code} = 'land';
+    } elsif ($breadcrumbs =~ /гараж/) {
+        $data->{type_code} = 'garage';
+    } elsif ($breadcrumbs =~ /торговля и сервис/) {
+        $data->{type_code} = 'market_place';
+    } elsif ($breadcrumbs =~ /магазин/) {
+        $data->{type_code} = 'market_place';
+    } elsif ($breadcrumbs =~ /павильон/) {
+        $data->{type_code} = 'market_place';
+    } elsif ($breadcrumbs =~ /офис/) {
+        $data->{type_code} = 'office_place';
+    } elsif ($breadcrumbs =~ /нежилое помещение/) {
+        $data->{type_code} = 'gpurpose_place';
+    } elsif ($breadcrumbs =~ /склад/) {
+        $data->{type_code} = 'warehouse_place';
+    } elsif ($breadcrumbs =~ /производство/) {
+        $data->{type_code} = 'production_place';
+    } elsif ($breadcrumbs =~ /свободного назначения/) {
+        $data->{type_code} = 'gpurpose_place';
+    } elsif ($breadcrumbs =~ /помещение/) {
+        $data->{type_code} = 'gpurpose_place';
+    } else {
+        $data->{type_code} = 'other';
+    }
+
+
+    my @owner_phones = ();
+    if ($dom->find('div[class~="js-productPagePhoneLabel"]')->first) {
+        my $phone_num_raw = decode_base64($dom->find('div[class~="js-productPagePhoneLabel"]')->first->attr('data-phone'));
+
+        if (my $phone_num = Util::PhoneNum->parse($phone_num_raw, $config->{phone_prefix})) {
+            push @owner_phones, $phone_num;
+        }
+    } else {
+        say 'no phone?'
+    }
+
+    $data->{'owner_phones'} = \@owner_phones;
+
+    my $n = $dom->find('div[class~="productPagePrice"]')->first;
+    if ($n) {
+        my $cost = $n->all_text;
+        if ($cost) {
+            $cost =~ s/\D//g;
+            $data->{'owner_price'} = $cost / 1000;
+        }
+    }
+
+    my $text;
+    $n = $dom->find('p[class~="js-productPageDescription"]')->first;
+    if ($n) {
+        $text = $n->all_text;
+        $data->{'source_media_text'} = $text;
+    }
+
+    my $addr;
+    $n = $dom->find('div[class~="productPage__infoTextBold js-scrollToMap"]')->first;
+    if ($n) {
+        $addr = $n->all_text;
+    }
+    say $addr;
+
+    if ($addr) {
+
+        $data->{'address'} = $addr;
+
+    }
+
+    $dom->find('li[class~="productPage__infoColumnBlockText"]')->each(sub {
+
+        my $tfield = lc $_->text;
+        my $tkey = '';
+        my $tval = '';
+
+        if ($tfield =~ /(.+?): (.+)/) {
+          $tkey = $1;
+          $tval = $2;
+        } else {
+          $tkey = $tfield;
+          $tval = $tfield;
+        }
+
+        my $tnum = $tval;
+
+        if($tnum =~ /(\d+(?:,\d+)?)/) {
+            $tnum = $1;
+        } else {
+            $tnum =~ s/\D//g;
+        }
+
+        say '---';
+        say 'key: ' . $tkey;
+        say 'kval: ' . $tval;
+
+        given ($tkey) {
+
+            when ("этаж") {
+                $data->{'floor'} = $tnum;
+            }
+
+            when ("количество этажей") {
+                $data->{'floors_count'} = $tnum;
+            }
+
+            when ("этажей в здании") {
+                $data->{'floors_count'} = $tnum;
+            }
+
+            when ("количество комнат") {
+                $data->{'rooms_count'} = $tnum;
+            }
+
+            when ("комнат в квартире") {
+                $data->{'rooms_count'} = $tnum;
+            }
+
+            when ("общая площадь") {
+                $data->{'square_total'} = $tnum;
+            }
+
+            when ("жилая площадь") {
+                $data->{'square_living'} = $tnum;
+            }
+
+            when ("площадь кухни") {
+                $data->{'square_kitchen'} = $tnum;
+            }
+
+            when ("материал стен") {
+                given($tval) {
+                    when (/кирпичный/) {
+                        $data->{'house_type_id'} = 1;
+                    }
+                    when (/деревянный/) {
+                        $data->{'house_type_id'} = 4;
+                    }
+                    when (/панельный/) {
+                        $data->{'house_type_id'} = 3;
+                    }
+                    when (/монолитный/) {
+                        $data->{'house_type_id'} = 2;
+                    }
+                }
+            }
+
+            when ("ремонт") {
+
+            }
+
+            when ("балкон/лоджия") {
+
+            }
+
+            when ("санузел") {
+
+            }
+
+            when ("площадь строения") {
+                $data->{'square_total'} = $tnum;
+            }
+
+            when ("площадь участка") {
+                $data->{'square_land'} = $tnum;
+                $data->{'square_land_type'} = 'ar';
+            }
+
+            when ("строение") {
+                if ($tval =~ /коттедж/i) {
+                    $data->{'type_code'} = 'cottage';
+                } else {
+
+                }
+            }
+
+            when ("комнат в квартире/общежитии") {
+                $data->{'rooms_count'} = $tnum;
+            }
+
+            when ("количество комнат на продажу") {
+                $data->{'rooms_offer_count'} = $tnum;
+            }
+
+            when ("комнат сдается") {
+                $data->{'rooms_offer_count'} = $tnum;
+            }
+
+            when ("площадь арендуемой комнаты") {
+                $data->{'square_total'} = $tnum;
+            }
+
+            when ("площадь продажи") {
+                $data->{'square_total'} = $tnum;
+            }
+
+            when ("период аренды") {
+                if ($tval =~ /краткосрочная/i) {
+                    $data->{'rent_type'} = 'short';
+                }
+            }
+        }
+    });
+
+
+    my @photos;
+    $dom->find('div[class~="productGallery"] img')->each ( sub {
+        my $img_url = $_->attr('data-src');
+        say 'image ' . $img_url;
+        push @photos, $img_url;
+    });
+    $data->{photo_url} = \@photos;
+
+
+    # доп проверки
+    if ($data->{'floor'} && $data->{'floors_count'}) {
+        if ($data->{'floor'} * 1 > $data->{'floors_count'} * 1) {
+            $data->{'floor'} = $data->{'floors_count'};
+        }
+    }
+}
+
+sub get_res {
+    my ($url, $headers) = @_;
+
+    say $url;
+
+    my $res;
+    my $code = 0;
+    my $retry = 15;
+
+    #push @headers, 'Referer' => $referer if $referer;
+    #push @headers, 'Accept' => $accept if $accept;
+    while ($code != 200 && $retry > 0) {
+        $retry -= 1;
+        if ($retry < 5) {
+            say 'retry left ' . $retry;
+        }
+        if ($retry != 15) {
+            sleep 3;
+        }
+        $res = $ua->get($url, {
+            'Host' => 'irr.ru',
+            'Connection' => 'keep-alive',
+            'Cache-Control' => 'max-age=0',
+            'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.114 Safari/537.36',
+            'Accept-Encoding' => 'gzip,deflate,sdch',
+            'Accept-Language' => 'ru-RU,ru;q=0.8,en-US;q=0.6,en;q=0.4',
+            @$headers,
+        })->res;
+
+        $code = $res->code unless $res->error;
+    }
+
+    if ($retry == 0) {
+        undef $res;
+    }
+
+    return $res;
+}
+
+sub make_eid {
+    my ($id, $date) = @_;
+
+    return $id . '_' . $date->strftime('%Y%m%d')
+}
+
+sub parse_date {
+    my $date = lc(shift);
+
+    say $date;
+
+    my $res;
+    my $dt_now = DateTime->now(time_zone => "+1000");
+    my $year = $dt_now->year();
+    my $mon = $dt_now->month();
+    my $mday = $dt_now->mday();
+
+    if ($date =~ /(\d{1,2}):(\d{1,2})/) {
+        $res = $parser->parse_datetime("$year-$mon-$mday $1:$2");
+        if ($res > $dt_now) {
+            # substr 1 day
+            $res->subtract(days => 1);
+        }
+    } elsif ($date =~ /(\d+) (\w+) (\d+)/) {
+        my $a_mon = month_num($2);
+        my $a_year = $3;
+        say $a_mon;
+        say $a_year;
+        $res = $parser->parse_datetime("$a_year-$a_mon-$1 12:00");
+    } else {
+        $res = $dt_now;
+    }
+
+    say $res;
+
+    return $res;
+}
+
+sub month_num {
+    my $month_str = lc(shift);
+
+    given ($month_str) {
+        when (/янв/) {
+            return 1;
+        }
+        when (/фев/) {
+            return 2;
+        }
+        when (/мар/) {
+            return 3;
+        }
+        when (/апр/) {
+            return 4;
+        }
+        when (/мая/) {
+            return 5;
+        }
+        when (/июн/) {
+            return 6;
+        }
+        when (/июл/) {
+            return 7;
+        }
+        when (/авг/) {
+            return 8;
+        }
+        when (/сен/) {
+            return 9;
+        }
+        when (/окт/) {
+            return 10;
+        }
+        when (/ноя/) {
+            return 11;
+        }
+        when (/дек/) {
+            return 12;
+        }
+    }
+    return 0;
+}
