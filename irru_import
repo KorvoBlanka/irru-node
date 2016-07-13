@@ -10,7 +10,6 @@ use Mojo::ByteStream;
 use Mojo::UserAgent;
 use DateTime;
 use DateTime::Format::Strptime;
-use Text::Trim;
 use JSON;
 use MIME::Base64;
 use Data::Dumper;
@@ -33,7 +32,8 @@ my $parser = DateTime::Format::Strptime->new( pattern => '%Y-%m-%d %H:%M' );
 
 my $ua = Mojo::UserAgent->new;
 $ua->max_redirects(4);
-
+my @headers;
+push @headers, $config->{host};
 
 while (1) {
     say 'cycle starts';
@@ -427,13 +427,13 @@ sub get_res {
             sleep 3;
         }
         $res = $ua->get($url, {
-            'Host' => 'irr.ru',
+            @$headers,
             'Connection' => 'keep-alive',
             'Cache-Control' => 'max-age=0',
             'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.114 Safari/537.36',
             'Accept-Encoding' => 'gzip,deflate,sdch',
             'Accept-Language' => 'ru-RU,ru;q=0.8,en-US;q=0.6,en;q=0.4',
-            @$headers,
+
         })->res;
 
         $code = $res->code unless $res->error;
