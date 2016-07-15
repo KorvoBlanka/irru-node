@@ -61,7 +61,7 @@ sub send_data {
     say 'sending data';
 
     for my $data (@{$data_list}) {
-        my $url_str = $import_server . '/api/remote_import/upload_result';
+        my $url_str = $import_server . '/remoteimport/upload_result';
         my $data_str = Dumper $data;
         my $done = 0;
         while (!$done) {
@@ -85,7 +85,7 @@ sub send_data {
 sub get_url_list {
     my $url_list;
 
-    my $tx = $ua->get($import_server . '/api/remote_import/get_task',
+    my $tx = $ua->get($import_server . '/remoteimport/get_task',
       form => {
         source => 'irr',
         count => 1
